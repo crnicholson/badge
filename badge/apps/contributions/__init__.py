@@ -227,6 +227,58 @@ def parse_iso_date(s):
     return days_from_civil(int(parts[0]), int(parts[1]), int(parts[2]))
 
 
+# ------------------------------------------------------------ parsing ---
+# Shared by both the network-fetch path and the instant disk-cache-load
+# path, so the two can never drift out of sync with each other.
+
+def parse_user_payload(raw):
+    r = json.loads(raw)
+    login = r.get("login")
+    name = r.get("name") or login
+    followers = r.get("followers", 0)
+    return name, followers, login
+
+
+def parse_contrib_payload(raw):
+    r = json.loads(raw)
+    days = []
+    computed_total = 0
+    for week in (r.get("weeks") or []):
+        try:
+            base = parse_iso_date(week["first_day"])
+        except Exception:
+            continue
+        for day in (week.get("contribution_days") or []):
+            level = day.get("level", 0)
+            count = day.get("count", 0)
+            if not (0 <= level < len(LEVELS)):
+                level = 0
+            days.append((base + day.get("weekday", 0), level, count))
+            computed_total += count
+    days.sort(key=lambda d: d[0])
+    total = r.get("total_contributions") or computed_total
+    return days, total
+
+
+def parse_events_payload(raw):
+    r = json.loads(raw)
+    events = []
+    for e in r[:8]:
+        repo = (e.get("repo") or {}).get("name", "?")
+        payload = e.get("payload") or {}
+        events.append((e.get("type", ""), repo, payload.get("ref"), e.get("created_at", "")))
+    return events
+
+
+def clear_cache():
+    for f in (CONTRIB_FILE, EVENTS_FILE, USER_FILE, AVATAR_FILE, TIMEZONE_FILE):
+        try:
+            if file_exists(f):
+                os.remove(f)
+        except Exception:
+            pass
+
+
 def local_from_utc(y, m, d, hh, mm):
     """Shift a UTC civil time by TIMEZONE_OFFSET_HOURS, handling day
     rollover, and return (local_ordinal, local_hour, local_minute)."""
@@ -239,12 +291,24 @@ def local_from_utc(y, m, d, hh, mm):
 # ------------------------------------------------------------------ Store ---
 
 class Store:
+    # Fields refreshed silently in the background, in this order. Timezone
+    # is deliberately excluded: it's a one-time-per-boot lookup, not
+    # something that needs to be re-polled every refresh cycle.
+    REFRESH_STEPS = ("_fetch_user", "_fetch_contribs", "_fetch_events", "_fetch_avatar")
+
     def __init__(self):
         self.handle = None
+        self.bootstrapped = False  # have we attempted the instant cache-load yet
+        self.refreshing = False
+        self._refresh_index = 0
+        self._refresh_task = None
         self.reset()
 
     def reset(self, force_update=False):
+        """Full cold reset: null every field, so the app shows the
+        blocking 'loading' screen until fresh data arrives again."""
         self.name = None
+        self.followers = None
         self.total = None
         self.days = None          # [(ordinal, level, count), ...] sorted
         self.longest = None       # (length, start_ordinal, end_ordinal)
@@ -253,19 +317,89 @@ class Store:
         self.avatar = None
         self._task = None
         self._force_update = force_update
+        self.refreshing = False
+        self._refresh_index = 0
+        self._refresh_task = None
 
-    # -- fetch steps, chained one at a time from draw() --------------------
+    def fully_loaded(self):
+        return (self.name is not None and self.days is not None
+                and self.events is not None and self.avatar is not None)
+
+    def load_cached(self):
+        """Instant, network-free: populate every field straight from the
+        on-disk cache, IF it exists and belongs to the configured GitHub
+        user. All-or-nothing — a partial/corrupt cache is treated as no
+        cache at all rather than showing a half-updated mix."""
+        try:
+            if not (file_exists(USER_FILE) and file_exists(CONTRIB_FILE)
+                    and file_exists(EVENTS_FILE) and file_exists(AVATAR_FILE)):
+                return False
+
+            name, followers, login = parse_user_payload(open(USER_FILE, "r").read())
+            if login != self.handle:
+                return False  # cache belongs to a different GitHub user
+
+            days, total = parse_contrib_payload(open(CONTRIB_FILE, "r").read())
+            events = parse_events_payload(open(EVENTS_FILE, "r").read())
+            avatar = Image.load(AVATAR_FILE)
+
+            self.name, self.followers = name, followers
+            self.days, self.total = days, total
+            self.events = events
+            self.avatar = avatar
+            self._compute_stats()
+            gc.collect()
+            return True
+        except Exception as e:
+            message(f"Failed to load cache: {e}")
+            return False
+
+    def begin_refresh(self):
+        """Kick off a silent background refresh. Existing fields stay on
+        screen untouched the whole time; each is only overwritten once
+        its own fresh fetch actually succeeds."""
+        self.refreshing = True
+        self._refresh_index = 0
+        self._refresh_task = None
+        self._force_update = True
+
+    def refresh_tick(self):
+        """Advance one step of an in-progress background refresh. Safe
+        to call every frame; it's a no-op once the cycle is done."""
+        if self._refresh_index >= len(Store.REFRESH_STEPS):
+            self.refreshing = False
+            return
+        step = getattr(self, Store.REFRESH_STEPS[self._refresh_index])
+        if not self._refresh_task:
+            self._refresh_task = step()
+        try:
+            next(self._refresh_task)
+        except StopIteration:
+            self._refresh_task = None
+            self._refresh_index += 1
+        except Exception as e:
+            message(f"Background refresh step failed: {e}")
+            self._refresh_task = None
+            self._refresh_index += 1
+
+    # -- fetch steps, chained one at a time. On failure: if this is a
+    # cold start (field still None) fall back to a safe default so the
+    # app can proceed; if we already have good old data, leave it alone
+    # rather than overwrite it with a placeholder. ----------------------
 
     def _fetch_user(self):
-        yield from async_fetch_to_disk(
-            DETAILS_URL.format(user=self.handle), USER_FILE, self._force_update)
         try:
-            r = json.loads(open(USER_FILE, "r").read())
-            self.name = r.get("name") or self.handle
-            del r
+            yield from async_fetch_to_disk(
+                DETAILS_URL.format(user=self.handle), USER_FILE, self._force_update)
+            name, followers, _login = parse_user_payload(open(USER_FILE, "r").read())
+            self.name = name
+            self.followers = followers
         except Exception as e:
-            message(f"Failed to parse user data: {e}")
-            self.name = self.handle
+            message(f"Failed to fetch user data: {e}")
+            if self.name is None:
+                self.name = self.handle
+            if self.followers is None:
+                self.followers = 0
         gc.collect()
 
     def _fetch_contribs(self):
@@ -273,43 +407,17 @@ class Store:
             yield from async_fetch_to_disk(
                 CONTRIB_URL.format(user=self.handle), CONTRIB_FILE,
                 self._force_update, timeout_ms=15000)
+            days, total = parse_contrib_payload(open(CONTRIB_FILE, "r").read())
+            self.days = days
+            self.total = total
+            self._compute_stats()
         except Exception as e:
             message(f"Failed to fetch contrib data: {e}")
-            self.total = 0
-            self.days = []
-            self._compute_stats()
-            return
-
-        try:
-            r = json.loads(open(CONTRIB_FILE, "r").read())
-        except Exception as e:
-            message(f"Failed to parse contrib JSON: {e}")
-            self.total = 0
-            self.days = []
-            self._compute_stats()
-            return
-
-        days = []
-        computed_total = 0
-        for week in (r.get("weeks") or []):
-            try:
-                base = parse_iso_date(week["first_day"])
-            except Exception:
-                continue
-            for day in (week.get("contribution_days") or []):
-                level = day.get("level", 0)
-                count = day.get("count", 0)
-                if not (0 <= level < len(LEVELS)):
-                    level = 0
-                days.append((base + day.get("weekday", 0), level, count))
-                computed_total += count
-
-        days.sort(key=lambda d: d[0])
-        self.days = days
-        self.total = r.get("total_contributions") or computed_total
-        del r
+            if self.days is None:
+                self.total = 0
+                self.days = []
+                self._compute_stats()
         gc.collect()
-        self._compute_stats()
 
     def _fetch_timezone(self):
         global TIMEZONE_OFFSET_HOURS
@@ -321,45 +429,30 @@ class Store:
             del r
         except Exception as e:
             message(f"Failed to detect timezone: {e}")
-            TIMEZONE_OFFSET_HOURS = 0
+            if TIMEZONE_OFFSET_HOURS is None:
+                TIMEZONE_OFFSET_HOURS = 0
         gc.collect()
 
     def _fetch_events(self):
         try:
             yield from async_fetch_to_disk(
                 EVENTS_URL.format(user=self.handle), EVENTS_FILE, self._force_update)
+            self.events = parse_events_payload(open(EVENTS_FILE, "r").read())
         except Exception as e:
             message(f"Failed to fetch events: {e}")
-            self.events = []
-            return
-
-        try:
-            r = json.loads(open(EVENTS_FILE, "r").read())
-        except Exception as e:
-            message(f"Failed to parse events JSON: {e}")
-            self.events = []
-            return
-
-        events = []
-        for e in r[:8]:
-            repo = (e.get("repo") or {}).get("name", "?")
-            payload = e.get("payload") or {}
-            events.append((e.get("type", ""), repo, payload.get("ref"), e.get("created_at", "")))
-        self.events = events
-        del r
+            if self.events is None:
+                self.events = []
         gc.collect()
 
     def _fetch_avatar(self):
         try:
             yield from async_fetch_to_disk(
                 AVATAR_URL.format(user=self.handle), AVATAR_FILE, self._force_update)
-            if file_exists(AVATAR_FILE):
-                self.avatar = Image.load(AVATAR_FILE)
-            else:
-                self.avatar = False
+            self.avatar = Image.load(AVATAR_FILE)
         except Exception as e:
             message(f"Failed to get avatar: {e}")
-            self.avatar = False
+            if self.avatar is None:
+                self.avatar = False
 
     def _compute_stats(self):
         longest = (0, None, None)
@@ -386,13 +479,13 @@ class Store:
                 break
         self.current = current
 
-    # -- called once per frame while data is incomplete ---------------------
+    # -- cold-start driver: called once per frame until fully_loaded() ---
 
     def tick(self):
-        """Advance the current fetch step. Returns a short status label,
-        or None once every field is populated."""
+        """Advance the cold-start fetch sequence. Returns a short status
+        label, or None once every field is populated."""
         if self.name is None:
-            label = "user"
+            label = "profile"
             step = self._fetch_user
         elif self.days is None:
             label = "contributions"
@@ -435,33 +528,23 @@ def center_text(text, y, font=small_font):
 
 
 def draw_background():
-    """Ambient backdrop: a dim, slowly-drifting contribution heatmap."""
+    """Ambient backdrop: a dim, slowly-drifting contribution heatmap.
+    Only ever called once the app is fully_loaded(), so store.days is
+    always populated here."""
     size, gap = 15, 2
     unit = size + gap
     grid_width = 53 * unit
     xo = int(-math.sin(io.ticks / 45000) * ((grid_width - 160) / 2)
              + (grid_width - 160) / 2)
 
-    if store.days:
-        for i, (_ordinal, level, _count) in enumerate(store.days):
-            col, row = i // 7, i % 7
-            x = col * unit - xo
-            y = row * unit + 6
-            if x + size < 0 or x > 160:
-                continue
-            screen.brush = LEVELS_BG[level]
-            screen.draw(shapes.rounded_rectangle(x, y, size, size, 3))
-    else:
-        # Loading placeholder: a faint static grid so the backdrop is
-        # never blank while the real data is still in flight.
-        for col in range(12):
-            for row in range(7):
-                x = col * unit - (xo % unit)
-                y = row * unit + 6
-                if x + size < 0 or x > 160:
-                    continue
-                screen.brush = LEVELS_BG[0]
-                screen.draw(shapes.rounded_rectangle(x, y, size, size, 3))
+    for i, (_ordinal, level, _count) in enumerate(store.days):
+        col, row = i // 7, i % 7
+        x = col * unit - xo
+        y = row * unit + 6
+        if x + size < 0 or x > 160:
+            continue
+        screen.brush = LEVELS_BG[level]
+        screen.draw(shapes.rounded_rectangle(x, y, size, size, 3))
 
 
 def draw_page_dots():
@@ -476,11 +559,31 @@ def draw_page_dots():
 
 
 def draw_fetching(label):
-    text = ("fetching " + label) if wifi_up else "connecting to wifi"
-    center_text(text, 60, small_font)
+    """Blocking loading screen: only shown on a true cold start (no
+    usable cache), when the configured GitHub user changed, or right
+    after the cache was manually cleared. Deliberately big and clear
+    since the user is stuck waiting on it."""
     dots = "." * ((int(io.ticks / 400) % 3) + 1)
-    screen.brush = faded
-    center_text(dots, 72, small_font)
+
+    if not wifi_up:
+        screen.font = large_font
+        screen.brush = white
+        center_text("connecting", 40, large_font)
+        screen.font = small_font
+        screen.brush = phosphor
+        center_text("to wifi" + dots, 62)
+        return
+
+    steps = (store.name, store.days, store.events, store.avatar)
+    done = sum(1 for s in steps if s is not None)
+    total = len(steps)
+
+    screen.font = large_font
+    screen.brush = white
+    center_text("loading", 40, large_font)
+    screen.font = small_font
+    screen.brush = phosphor
+    center_text(f"{label} ({min(done + 1, total)}/{total}){dots}", 62)
 
 
 def fmt_num(n):
@@ -505,10 +608,7 @@ def draw_half_grid(days_slice, weeks, size, unit, top):
 
 
 def draw_graph():
-    if store.days is None:
-        draw_fetching(store.tick() or "contributions")
-        return
-
+    # _update() only dispatches here once store.fully_loaded() is true.
     # Two ~6-month halves stacked on top of each other, so each half
     # gets roughly double the cell size of a single 53-week strip.
     size, gap = 4, 1
@@ -582,11 +682,8 @@ def format_when(iso):
 
 
 def draw_activity():
-    if store.events is None:
-        draw_fetching(store.tick() or "activity")
-        return
-
     if not store.events:
+        screen.brush = white
         center_text("no recent public activity", 60)
         return
 
@@ -641,10 +738,6 @@ def draw_stat(label, value, x, y):
 
 
 def draw_stats():
-    if store.avatar is None or store.days is None:
-        draw_fetching(store.tick() or "profile")
-        return
-
     screen.font = large_font
     screen.brush = white
     center_text(store.handle, 3, large_font)
@@ -666,7 +759,7 @@ def draw_stats():
 
     longest_len, _longest_start, _longest_end = store.longest
 
-    draw_stat("contribs", fmt_num(store.total) if store.total else 0, STAT_X, 34)
+    draw_stat("followers", fmt_num(store.followers) if store.followers else 0, STAT_X, 34)
     draw_stat("streak", f"{longest_len}d", STAT_X, 61)
     draw_stat("current", f"{store.current}d", STAT_X, 88)
 
@@ -719,7 +812,10 @@ def _update():
     if io.BUTTON_DOWN in io.pressed or io.BUTTON_C in io.pressed:
         page = (page + 1) % len(PAGES)
 
-    if io.BUTTON_B in io.pressed or (io.BUTTON_A in io.held and io.BUTTON_C in io.held):
+    # A+C held: wipe the on-disk cache entirely and force a real
+    # from-scratch (blocking, visible-progress) fetch.
+    if io.BUTTON_A in io.held and io.BUTTON_C in io.held:
+        clear_cache()
         store.reset(force_update=True)
         last_refresh = io.ticks
         ticks_start = io.ticks  # fresh wifi-timeout window for the refetch
@@ -731,28 +827,64 @@ def _update():
         no_secrets_error()
         return
 
-    if not wlan_start():
-        connection_error()
+    if not store.bootstrapped:
+        store.bootstrapped = True
+        if store.load_cached():
+            # Old data loaded instantly from disk (no network needed) -
+            # show it right away, then quietly look for anything newer.
+            last_refresh = io.ticks
+            store.begin_refresh()
+
+    wlan_ok = wlan_start()
+
+    # B: refresh now, in the background, without disturbing what's on
+    # screen (same mechanism as the periodic timer below, on demand).
+    if io.BUTTON_B in io.pressed and store.fully_loaded() and not store.refreshing:
+        store.begin_refresh()
+        last_refresh = io.ticks
+
+    if not store.fully_loaded():
+        # True cold start: no usable cache (first ever run, cache just
+        # cleared, or the configured GitHub user changed since the
+        # cache was written). Nothing to show yet, so block here with
+        # clearly visible progress until the first data lands.
+        if not wlan_ok:
+            connection_error()
+            return
+        label = store.tick()
+        draw_fetching(label or "data")
         return
 
-    if last_refresh is None:
-        last_refresh = io.ticks
-    elif io.ticks - last_refresh > REFRESH_INTERVAL_MS:
-        store.reset(force_update=True)
-        last_refresh = io.ticks
+    # We have something to show. Keep it fresh in the background, but a
+    # slow or failed fetch must never interrupt what's already on screen.
+    if wlan_ok:
+        if TIMEZONE_OFFSET_HOURS is None:
+            # Only reachable when data came from load_cached(), which
+            # skips the cold tick() sequence entirely (and with it the
+            # only other place this gets auto-detected). tick() itself
+            # is a no-op past this point since name/days/events/avatar
+            # are already set, so this just resolves the timezone.
+            store.tick()
+
+        if last_refresh is None:
+            last_refresh = io.ticks
+        elif io.ticks - last_refresh > REFRESH_INTERVAL_MS and not store.refreshing:
+            store.begin_refresh()
+            last_refresh = io.ticks
+        if store.refreshing:
+            store.refresh_tick()
 
     if page == 0:
-        # The graph page already renders the real heatmap at full
-        # detail, so the dim ambient copy would just look muddy here.
         draw_background()
         draw_stats()
     elif page == 1:
+        # The graph page already renders the real heatmap at full
+        # detail, so the dim ambient copy would just look muddy here.
         draw_graph()
     else:
         draw_background()
         draw_activity()
 
-        
     draw_page_dots()
 
 

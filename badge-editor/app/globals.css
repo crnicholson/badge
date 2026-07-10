@@ -1,0 +1,38 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  @apply bg-ink text-mist antialiased;
+}
+
+::selection {
+  background: rgba(211, 250, 55, 0.25);
+}
+
+:focus-visible {
+  outline: 2px solid #d3fa37;
+  outline-offset: 2px;
+}
+
+@keyframes led-breathe {
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 6px 1px rgba(46, 160, 67, 0.7);
+  }
+  50% {
+    opacity: 0.55;
+    box-shadow: 0 0 2px 0 rgba(46, 160, 67, 0.3);
+  }
+}
+
+.led-online {
+  animation: led-breathe 2.2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .led-online {
+    animation: none;
+  }
+}

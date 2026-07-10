@@ -11,6 +11,7 @@ import importlib.util
 import json
 import math
 import os
+import struct
 import sys
 import traceback
 from types import ModuleType
@@ -587,6 +588,181 @@ class brushes:
         return brushes.color(r, g, b, a)
 
 
+def _parse_ppf(path: str):
+    """Parse a `.ppf` bitmap pixel-font (the format used by the real badge's
+    `PixelFont.load`). This is a reverse-engineered binary layout:
+
+      magic        4 bytes  b"ppf!"
+      reserved     4 bytes  (unused)
+      num_glyphs   u16 BE
+      unused       u16 BE   (not needed for rendering)
+      name_len     u16 BE
+      name         name_len bytes, then zero-padded up to a 48-byte header
+      glyph table  num_glyphs * 6 bytes: [codepoint u16][width u16][unused u16]
+      glyph bitmap num_glyphs * height * row_bytes bytes, glyphs in table
+                   order; each row is a big-endian integer of `row_bytes`
+                   bytes, MSB-first, the leftmost `width` bits are the pixels
+      trailer      2 bytes (unused)
+
+    `row_bytes` and `height` aren't stored directly - they're derived from
+    the widest glyph's width and the remaining file size (both divide out
+    exactly once you know the real row width, which is how this was
+    reverse-engineered against the actual font files).
+    """
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if data[:4] != b"ppf!":
+        raise ValueError(f"Not a ppf font: {path}")
+
+    num_glyphs = struct.unpack(">H", data[8:10])[0]
+    default_advance = struct.unpack(">H", data[10:12])[0]
+    name_len = struct.unpack(">H", data[12:14])[0]
+    name = data[14:14 + name_len].split(b"\x00", 1)[0].decode("utf-8", "replace")
+
+    table_start = 48
+    entries = []
+    max_width = 1
+    for i in range(num_glyphs):
+        off = table_start + i * 6
+        code, width, _unused = struct.unpack(">HHH", data[off:off + 6])
+        entries.append((code, width))
+        if width > max_width:
+            max_width = width
+
+    table_end = table_start + num_glyphs * 6
+    row_bytes = 2 * max(1, math.ceil(max_width / 16))
+    blob_len = len(data) - table_end
+    height = (blob_len + 2) // (row_bytes * num_glyphs)
+    if height <= 0:
+        raise ValueError(f"Could not determine glyph height for {path}")
+
+    glyph_size = height * row_bytes
+    glyphs = {}
+    for idx, (code, width) in enumerate(entries):
+        off = table_end + idx * glyph_size
+        chunk = data[off:off + glyph_size]
+        if len(chunk) < glyph_size:
+            chunk = chunk + b"\x00" * (glyph_size - len(chunk))
+        rows = [
+            int.from_bytes(chunk[r * row_bytes:(r + 1) * row_bytes], "big")
+            for r in range(height)
+        ]
+        glyphs[code] = (width, rows)
+
+    return name, height, row_bytes, default_advance, glyphs
+
+
+def _thin_row(value: int, width: int, bits: int, min_run: int = 3) -> int:
+    """Shave the trailing pixel off runs of `min_run`-or-more consecutive
+    set bits in a row. Used to shed a little weight off an especially bold
+    font without ever fully erasing a thin (1-2px) stroke."""
+    row = [(value >> (bits - 1 - c)) & 1 for c in range(width)]
+    run_start = None
+    for c in range(width + 1):
+        on = row[c] if c < width else 0
+        if on:
+            if run_start is None:
+                run_start = c
+        elif run_start is not None:
+            if c - run_start >= min_run:
+                row[c - 1] = 0
+            run_start = None
+    result = 0
+    for c, bit in enumerate(row):
+        result |= bit << (bits - 1 - c)
+    return result
+
+
+class _PPFFont:
+    """Renders text using a real badge `.ppf` pixel font, matching the
+    hardware's glyph shapes and spacing instead of a generic system font."""
+
+    _cache = {}
+
+    def __init__(self, path: str):
+        name, height, row_bytes, default_advance, glyphs = _parse_ppf(path)
+        self.name = name
+        self.height = height
+        self._bits = row_bytes * 8
+        if name.strip().lower().startswith("absolute"):
+            # "Absolute" is the boldest of the bundled fonts by a wide
+            # margin (its glyphs are ~47% ink vs. ~20-40% for the rest) and
+            # reads a little too heavy on screen - trim a hair off its
+            # thicker strokes. Thinner strokes (<3px) are left untouched.
+            glyphs = {
+                code: (width, [_thin_row(v, width, self._bits) for v in rows])
+                for code, (width, rows) in glyphs.items()
+            }
+        self._glyphs = glyphs
+        self._fallback_advance = default_advance or max(1, height // 2)
+        self._mask_cache = {}
+        self._tint_cache = {}
+
+    @staticmethod
+    def load(path: str) -> "_PPFFont":
+        font = _PPFFont._cache.get(path)
+        if font is None:
+            font = _PPFFont(path)
+            _PPFFont._cache[path] = font
+        return font
+
+    def get_height(self) -> int:
+        return self.height
+
+    def _advance(self, ch: str) -> int:
+        glyph = self._glyphs.get(ord(ch))
+        if glyph and glyph[0] > 0:
+            return glyph[0]
+        return self._fallback_advance
+
+    def size(self, text) -> tuple:
+        text = str(text)
+        width = sum(self._advance(ch) for ch in text)
+        return (width, self.height)
+
+    def _glyph_mask(self, code: int):
+        if code in self._mask_cache:
+            return self._mask_cache[code]
+        glyph = self._glyphs.get(code)
+        mask = None
+        if glyph and glyph[0] > 0:
+            width, rows = glyph
+            mask = pygame.Surface((width, self.height), pygame.SRCALPHA)
+            mask.lock()
+            for r, val in enumerate(rows):
+                for c in range(width):
+                    if (val >> (self._bits - 1 - c)) & 1:
+                        mask.set_at((c, r), (255, 255, 255, 255))
+            mask.unlock()
+        self._mask_cache[code] = mask
+        return mask
+
+    def _tinted_glyph(self, code: int, color):
+        key = (code, color)
+        if key in self._tint_cache:
+            return self._tint_cache[key]
+        mask = self._glyph_mask(code)
+        tinted = None
+        if mask is not None:
+            tinted = mask.copy()
+            tinted.fill((color[0], color[1], color[2], color[3] if len(color) > 3 else 255),
+                        special_flags=pygame.BLEND_RGBA_MULT)
+        self._tint_cache[key] = tinted
+        return tinted
+
+    def render(self, text, antialias=True, color=(255, 255, 255, 255)) -> pygame.Surface:
+        text = str(text)
+        width, height = self.size(text)
+        surf = pygame.Surface((max(1, width), max(1, height)), pygame.SRCALPHA)
+        x = 0
+        for ch in text:
+            tinted = self._tinted_glyph(ord(ch), color)
+            if tinted is not None:
+                surf.blit(tinted, (x, 0))
+            x += self._advance(ch)
+        return surf
+
+
 class PixelFont:
     class _Wrapper:
         __slots__ = ("_font", "name", "height")
@@ -612,25 +788,30 @@ class PixelFont:
     def load(path: str, size: int = 14):
         resolved = map_system_path(path)
         name = os.path.splitext(os.path.basename(path))[0]
+        ext = os.path.splitext(resolved)[1].lower()
+
+        if ext == ".ppf" and os.path.exists(resolved):
+            try:
+                font = _PPFFont.load(resolved)
+                if _perf_monitor and _perf_monitor.enabled:
+                    _perf_monitor.asset_tracker.register_font(resolved)
+                return font
+            except Exception:
+                traceback.print_exc()
+
         font = None
-        if os.path.exists(resolved):
-            ext = os.path.splitext(resolved)[1].lower()
-            if ext in {".ttf", ".otf", ".ttc"}:
-                try:
-                    font = pygame.font.Font(resolved, size)
-                except Exception:
-                    font = None
-            else:
-                # Pico pixel fonts (`.ppf`) aren't true TTF files; using the
-                # default pygame font keeps the simulator stable.
+        if os.path.exists(resolved) and ext in {".ttf", ".otf", ".ttc"}:
+            try:
+                font = pygame.font.Font(resolved, size)
+            except Exception:
                 font = None
         if font is None:
             font = pygame.font.Font(None, size)
-        
+
         # Track font loading for performance monitoring
         if _perf_monitor and _perf_monitor.enabled:
             _perf_monitor.asset_tracker.register_font(resolved)
-        
+
         return PixelFont._Wrapper(font, name)
 
 
@@ -881,11 +1062,11 @@ class Screen(_SurfaceTarget):
         
         # Draw the hint text
         hints = [
-            ("Z/A: A", 10),
-            ("X/B: B", 100),
-            ("Space/C: C", 180),
-            ("Arrows: D-pad", 300),
-            ("H/Esc: Home", 450)
+            ("Z/Left: A", 10),
+            ("X/Enter: B", 120),
+            ("Space/Right: C", 250),
+            ("Arrows: D-pad", 400),
+            ("H/Esc: Home", 540)
         ]
         
         for hint, x_pos in hints:
@@ -1000,19 +1181,24 @@ class IO:
         self.ticks = 0
         self.ticks_delta = 0
         self._last_ticks = pygame.time.get_ticks()
+        # Each key can map to more than one logical button - e.g. LEFT/RIGHT
+        # double up as A/C and Enter doubles up as B, so you can play without
+        # taking a hand off the arrow keys.
         self._key_map = {
-            pygame.K_a: IO.BUTTON_A,
-            pygame.K_b: IO.BUTTON_B,
-            pygame.K_c: IO.BUTTON_C,
-            pygame.K_UP: IO.BUTTON_UP,
-            pygame.K_DOWN: IO.BUTTON_DOWN,
-            pygame.K_LEFT: IO.BUTTON_LEFT,
-            pygame.K_RIGHT: IO.BUTTON_RIGHT,
-            pygame.K_z: IO.BUTTON_A,
-            pygame.K_x: IO.BUTTON_B,
-            pygame.K_SPACE: IO.BUTTON_C,
-            pygame.K_h: IO.BUTTON_HOME,
-            pygame.K_ESCAPE: IO.BUTTON_HOME,
+            pygame.K_a: (IO.BUTTON_A,),
+            pygame.K_b: (IO.BUTTON_B,),
+            pygame.K_c: (IO.BUTTON_C,),
+            pygame.K_UP: (IO.BUTTON_UP,),
+            pygame.K_DOWN: (IO.BUTTON_DOWN,),
+            pygame.K_LEFT: (IO.BUTTON_LEFT, IO.BUTTON_A),
+            pygame.K_RIGHT: (IO.BUTTON_RIGHT, IO.BUTTON_C),
+            pygame.K_z: (IO.BUTTON_A,),
+            pygame.K_x: (IO.BUTTON_B,),
+            pygame.K_SPACE: (IO.BUTTON_C,),
+            pygame.K_RETURN: (IO.BUTTON_B,),
+            pygame.K_KP_ENTER: (IO.BUTTON_B,),
+            pygame.K_h: (IO.BUTTON_HOME,),
+            pygame.K_ESCAPE: (IO.BUTTON_HOME,),
         }
 
     def update(self) -> None:
@@ -1027,14 +1213,14 @@ class IO:
                 if event.key == pygame.K_F12:
                     screen.take_screenshot()
                 elif event.key in self._key_map:
-                    name = self._key_map[event.key]
-                    self.pressed.add(name)
-                    self.down.add(name)
+                    for name in self._key_map[event.key]:
+                        self.pressed.add(name)
+                        self.down.add(name)
             if event.type == pygame.KEYUP:
                 if event.key in self._key_map:
-                    name = self._key_map[event.key]
-                    self.down.discard(name)
-                    self.released.add(name)
+                    for name in self._key_map[event.key]:
+                        self.down.discard(name)
+                        self.released.add(name)
         self.held = set(self.down)
         self.changed = set()
         self.changed.update(self.pressed)

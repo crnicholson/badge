@@ -11,6 +11,7 @@ import importlib.util
 import json
 import math
 import os
+import platform
 import struct
 import sys
 import traceback
@@ -987,20 +988,156 @@ class Matrix:
 
 
 class Screen(_SurfaceTarget):
-    def __init__(self, width: int = 160, height: int = 120, scale: int = 4, screenshot_dir: str = None) -> None:
+    # Physical size of the real badge's display, in millimetres.
+    PHYSICAL_WIDTH_MM = 57.6
+    PHYSICAL_HEIGHT_MM = 43.2
+    # Empirical size correction for "real size" mode (dialed in by eye against
+    # the physical badge). The +/- keys tweak further on top of this.
+    REAL_SIZE_SCALE = 1.12
+
+    # Where the display sits inside FRAME_IMAGE, in that image's own pixel
+    # space (measured against images/render_003.png, 1864x2000).
+    FRAME_SCREEN_RECT = (580, 1189, 718, 538)
+    FRAME_DISPLAY_HEIGHT = 900  # window height, in px, when frame mode is on
+
+    # Clickable hardware buttons in the mockup, in FRAME_IMAGE pixel space,
+    # each mapped to the badge button it presses. (String literals match
+    # IO.BUTTON_* - IO isn't defined yet at this point in the module.)
+    FRAME_BUTTON_RECTS = {
+        "BUTTON_A": (643, 1730, 130, 120),
+        "BUTTON_B": (867, 1730, 130, 120),
+        "BUTTON_C": (1092, 1730, 130, 120),
+        "BUTTON_UP": (1292, 1287, 120, 120),
+        "BUTTON_DOWN": (1292, 1537, 120, 120),
+    }
+
+    def __init__(self, width: int = 160, height: int = 120, scale: int = 4,
+                 screenshot_dir: str = None, dpi: float = 96.0) -> None:
         self.width = width
         self.height = height
         self.scale = scale
+        self.dpi = dpi
         self.screenshot_dir = screenshot_dir
         self._screenshot_counter = 0
-        # Add space below for keyboard hints (30 pixels)
-        self._window = pygame.display.set_mode((width * scale, height * scale + 30))
-        pygame.display.set_caption("Badge Local Simulator")
+        self.real_size_mode = False
+        self.frame_mode = False
+        self._frame_image = None
+        self._frame_load_attempted = False
+        # Persisted user calibration for real-size mode (see nudge_real_size);
+        # multiplies the detected DPI so it can be dialled to physically exact
+        # on any monitor, since reported display sizes aren't always accurate.
+        self.real_size_cal = self._load_calibration()
         surface = pygame.Surface((width, height), pygame.SRCALPHA)
         super().__init__(surface)
         self.antialias = Image.OFF
-        self._hint_font = pygame.font.Font(None, 16)
-    
+        # A real anti-aliased UI font for the hint bar - the bundled pygame
+        # default font renders grainy at small sizes.
+        self._hint_font = pygame.font.SysFont(
+            "Helvetica Neue,Helvetica,Arial,DejaVu Sans,Segoe UI,sans", 14)
+        self._window = None
+        self._apply_window_mode()
+        pygame.display.set_caption("Badge Local Simulator")
+
+    @staticmethod
+    def _calibration_path() -> str:
+        root = SIM_ROOT or _find_sim_root(os.getcwd())
+        path = os.path.join(root, ".badge_state")
+        os.makedirs(path, exist_ok=True)
+        return os.path.join(path, "sim_calibration.json")
+
+    def _load_calibration(self) -> float:
+        try:
+            with open(Screen._calibration_path(), "r", encoding="utf-8") as fh:
+                val = float(json.load(fh).get("real_size_cal", 1.0))
+                return min(4.0, max(0.25, val))
+        except Exception:
+            return 1.0
+
+    def _save_calibration(self) -> None:
+        try:
+            with open(Screen._calibration_path(), "w", encoding="utf-8") as fh:
+                json.dump({"real_size_cal": self.real_size_cal}, fh)
+        except Exception:
+            pass
+
+    def _effective_dpi(self) -> float:
+        return self.dpi * Screen.REAL_SIZE_SCALE * self.real_size_cal
+
+    def _physical_size_px(self) -> tuple:
+        """Window size, in on-screen pixels, that renders the 160x120
+        framebuffer at the real badge's physical display size (57.6x43.2mm)
+        given the monitor DPI (and the user's real-size calibration)."""
+        mm_to_px = self._effective_dpi() / 25.4
+        return (
+            max(1, round(Screen.PHYSICAL_WIDTH_MM * mm_to_px)),
+            max(1, round(Screen.PHYSICAL_HEIGHT_MM * mm_to_px)),
+        )
+
+    def nudge_real_size(self, factor: float) -> None:
+        """Live-calibrate real-size mode (bound to +/-). Persists so the badge
+        comes up physically exact next time."""
+        self.real_size_cal = min(4.0, max(0.25, self.real_size_cal * factor))
+        self._save_calibration()
+        if self.real_size_mode:
+            self._apply_window_mode()
+        w, h = self._physical_size_px()
+        print(f"[Simulator] Real-size calibration {self.real_size_cal:.2f}x -> {w}x{h}px")
+
+    def _load_frame_image(self):
+        if not self._frame_load_attempted:
+            self._frame_load_attempted = True
+            simulator_dir = os.path.dirname(os.path.abspath(__file__))
+            frame_path = os.path.join(simulator_dir, "..", "images", "render_003.png")
+            try:
+                self._frame_image = pygame.image.load(frame_path).convert_alpha()
+            except Exception as e:
+                print(f"[Simulator] Could not load device frame ({frame_path}): {e}")
+                self._frame_image = None
+        return self._frame_image
+
+    def _content_size(self) -> tuple:
+        """Size, in window pixels, of the main display area (excludes the
+        keyboard-hint bar)."""
+        if self.frame_mode and self._load_frame_image() is not None:
+            fw, fh = self._frame_image.get_size()
+            scale = Screen.FRAME_DISPLAY_HEIGHT / fh
+            return (round(fw * scale), round(fh * scale))
+        if self.real_size_mode:
+            return self._physical_size_px()
+        return (self.width * self.scale, self.height * self.scale)
+
+    def _show_hint_bar(self) -> bool:
+        # Shown in the plain and device-frame views. Hidden only in real-size
+        # mode, which is a true-to-life size reference a hint bar would swamp.
+        return not self.real_size_mode
+
+    def _apply_window_mode(self) -> None:
+        cw, ch = self._content_size()
+        if self._show_hint_bar():
+            _, bar_h = self._toolbar(cw)
+            ch += bar_h
+        # Always a normal, titled window - keeps the macOS traffic-light
+        # buttons (so it can be moved and closed) and shows the hint bar.
+        self._window = pygame.display.set_mode((cw, ch))
+
+    def toggle_real_size(self) -> None:
+        self.real_size_mode = not self.real_size_mode
+        self._apply_window_mode()
+        if self.real_size_mode:
+            w, h = self._physical_size_px()
+            print(f"[Simulator] Real-size mode on: {w}x{h}px. "
+                  f"Nudge with +/- if it's not the size you want.")
+        else:
+            print("[Simulator] Real-size mode off")
+
+    def toggle_frame_mode(self) -> None:
+        if not self.frame_mode and self._load_frame_image() is None:
+            print("[Simulator] Device frame image is unavailable, staying in normal mode.")
+            return
+        self.frame_mode = not self.frame_mode
+        self._apply_window_mode()
+        print(f"[Simulator] Device frame mode {'on' if self.frame_mode else 'off'}")
+
     def set_icon(self, icon_path: str) -> None:
         """Set the application icon (displayed in dock/taskbar)."""
         try:
@@ -1042,37 +1179,192 @@ class Screen(_SurfaceTarget):
         pygame.image.save(self._surface, filepath)
         print(f"Screenshot saved: {filepath}")
 
+    def _opaque_framebuffer(self) -> pygame.Surface:
+        """Flatten the (per-pixel-alpha) drawing surface onto an opaque
+        backing, matching the real hardware's framebuffer, which has no
+        concept of transparency. Without this, any pixel the app hasn't
+        explicitly drawn over lets whatever is *behind* the blit show
+        through - fine on the plain display, but wrong when compositing
+        into the device frame, where it let the mockup's own baked-in
+        screenshot bleed through instead of being fully replaced."""
+        opaque = pygame.Surface((self.width, self.height))
+        opaque.fill((0, 0, 0))
+        src = self._surface
+        # Ignore any surface-wide alpha / colorkey an app may have left set,
+        # so drawn pixels always transfer at full opacity (otherwise the
+        # screen area can composite to near-black in the device frame).
+        prev_alpha = src.get_alpha()
+        prev_ck = src.get_colorkey()
+        if prev_alpha is not None:
+            src.set_alpha(None)
+        if prev_ck is not None:
+            src.set_colorkey(None)
+        opaque.blit(src, (0, 0))
+        if prev_alpha is not None:
+            src.set_alpha(prev_alpha)
+        if prev_ck is not None:
+            src.set_colorkey(prev_ck)
+        return opaque
+
+    # (keycap text, what it does). ASCII only - many system fonts lack arrow
+    # glyphs and render them as blank "tofu" boxes.
+    _KEY_HINTS = [
+        ("Z / Left", "A"),
+        ("X / Enter", "B"),
+        ("Space / Right", "C"),
+        ("Arrows", "Move"),
+        ("H / Esc", "Home"),
+        ("R", "Reload"),
+        ("Shift", "Real size"),
+        ("+ / -", "Fit size"),
+        ("F", "Frame"),
+        ("P", "Charge"),
+        ("F12", "Shot"),
+    ]
+
+    def _toolbar(self, width: int):
+        """Build (and cache) the bottom hint bar for a given window width.
+        Rendered as crisp anti-aliased key-cap 'chips' that flow onto extra
+        rows if they don't fit, so every command is always shown. Returns
+        (surface, height)."""
+        if getattr(self, "_toolbar_cache", (None,))[0] == width:
+            return self._toolbar_cache[1], self._toolbar_cache[2]
+
+        pad_x, pad_y = 6, 3          # inside each key-cap chip
+        gap = 8                      # chip -> its label
+        item_gap = 20                # item -> next item
+        margin = 12                  # bar left/right padding
+        row_gap = 8
+        bar_pad_y = 8
+
+        font = self._hint_font
+        chip_bg = (58, 60, 68)
+        chip_fg = (236, 238, 242)
+        label_fg = (150, 153, 162)
+        bar_bg = (26, 27, 31)
+
+        # Pre-render each item's key-cap chip and label.
+        items = []
+        row_h = 0
+        for keys, label in Screen._KEY_HINTS:
+            key_surf = font.render(keys, True, chip_fg)
+            lbl_surf = font.render(label, True, label_fg)
+            chip_w = key_surf.get_width() + pad_x * 2
+            chip_h = key_surf.get_height() + pad_y * 2
+            item_w = chip_w + gap + lbl_surf.get_width()
+            item_h = max(chip_h, lbl_surf.get_height())
+            row_h = max(row_h, item_h)
+            items.append((key_surf, lbl_surf, chip_w, chip_h, item_w))
+
+        # Flow items into rows that fit `width`.
+        avail = max(1, width - margin * 2)
+        rows, cur, cur_w = [], [], 0
+        for it in items:
+            add = it[4] + (item_gap if cur else 0)
+            if cur and cur_w + add > avail:
+                rows.append(cur)
+                cur, cur_w = [], 0
+                add = it[4]
+            cur.append(it)
+            cur_w += add
+        if cur:
+            rows.append(cur)
+
+        bar_h = bar_pad_y * 2 + len(rows) * row_h + (len(rows) - 1) * row_gap
+        bar = pygame.Surface((width, bar_h))
+        bar.fill(bar_bg)
+
+        y = bar_pad_y
+        for row in rows:
+            x = margin
+            for key_surf, lbl_surf, chip_w, chip_h, item_w in row:
+                chip_y = y + (row_h - chip_h) // 2
+                chip_rect = pygame.Rect(x, chip_y, chip_w, chip_h)
+                pygame.draw.rect(bar, chip_bg, chip_rect, border_radius=4)
+                bar.blit(key_surf, (x + pad_x, chip_y + pad_y))
+                lbl_x = x + chip_w + gap
+                lbl_y = y + (row_h - lbl_surf.get_height()) // 2
+                bar.blit(lbl_surf, (lbl_x, lbl_y))
+                x += item_w + item_gap
+            y += row_h + row_gap
+
+        self._toolbar_cache = (width, bar, bar_h)
+        return bar, bar_h
+
+    def _frame_content_scale(self, cw: int):
+        """Scale factor from FRAME_IMAGE pixel space to the on-screen frame
+        content area (cw x frame-content-height)."""
+        fw = self._frame_image.get_width()
+        return cw / fw
+
+    def button_at(self, pos):
+        """Map a window (mouse) position to a badge button if it lands on one
+        of the mockup's hardware buttons, else None. Only meaningful in frame
+        mode - lets you 'press' the buttons in the image with the mouse."""
+        if not self.frame_mode or self._load_frame_image() is None:
+            return None
+        cw, _ch = self._content_size()
+        s = self._frame_content_scale(cw)
+        fx = pos[0] / s
+        fy = pos[1] / s
+        for name, (bx, by, bw, bh) in Screen.FRAME_BUTTON_RECTS.items():
+            if bx <= fx <= bx + bw and by <= fy <= by + bh:
+                return name
+        return None
+
+    def _compose_frame(self, cw: int, ch: int, pressed=()) -> pygame.Surface:
+        """Composite the live screen into the device-mockup image, and glow the
+        hardware buttons that are currently pressed (via keyboard or mouse) so
+        the button images visibly respond."""
+        fx, fy, fw, fh = Screen.FRAME_SCREEN_RECT
+        composed = self._frame_image.copy()  # RGBA
+        # Nearest-neighbour keeps the badge's own pixels crisp; the opaque
+        # framebuffer fully replaces the mockup's baked-in screenshot.
+        live = pygame.transform.scale(self._opaque_framebuffer(), (fw, fh))
+        composed.blit(live, (fx, fy))
+
+        for name in pressed:
+            rect = Screen.FRAME_BUTTON_RECTS.get(name)
+            if not rect:
+                continue
+            bx, by, bw, bh = rect
+            # Rounded-square glow to match the tactile buttons (not an oval).
+            glow = pygame.Surface((bw, bh), pygame.SRCALPHA)
+            radius = max(6, int(min(bw, bh) * 0.28))
+            pygame.draw.rect(glow, (130, 240, 140, 110), glow.get_rect(),
+                             border_radius=radius)
+            pygame.draw.rect(glow, (180, 255, 190, 220), glow.get_rect(),
+                             width=max(2, bw // 22), border_radius=radius)
+            composed.blit(glow, (bx, by))
+
+        return pygame.transform.smoothscale(composed, (cw, ch))
+
     def present(self) -> None:
-        # Scale and blit the game screen to a temporary surface
-        scaled_game = pygame.transform.scale(
-            self._surface, (self.width * self.scale, self.height * self.scale)
-        )
-        
-        # Blit the scaled game to the window
-        self._window.blit(scaled_game, (0, 0))
-        
-        # Draw keyboard hints below the screen
-        y_offset = self.height * self.scale
-        hint_bg = (40, 40, 40)
-        hint_text = (200, 200, 200)
-        
-        # Fill the hint area with dark background
-        hint_rect = pygame.Rect(0, y_offset, self.width * self.scale, 30)
-        pygame.draw.rect(self._window, hint_bg, hint_rect)
-        
-        # Draw the hint text
-        hints = [
-            ("Z/Left: A", 10),
-            ("X/Enter: B", 120),
-            ("Space/Right: C", 250),
-            ("Arrows: D-pad", 400),
-            ("H/Esc: Home", 540)
-        ]
-        
-        for hint, x_pos in hints:
-            text_surf = self._hint_font.render(hint, True, hint_text)
-            self._window.blit(text_surf, (x_pos, y_offset + 8))
-        
+        cw, ch = self._content_size()
+        bar_h = 0
+        if self._show_hint_bar():
+            _, bar_h = self._toolbar(cw)
+
+        if self.frame_mode and self._load_frame_image() is not None:
+            pressed = io.held if ('io' in globals() and io is not None) else ()
+            composed = self._compose_frame(cw, ch, pressed)
+            # pygame can't present a truly transparent window (its software
+            # framebuffer is opaque), so the see-through areas of the mockup
+            # sit on a neutral backdrop rather than the desktop.
+            self._window.fill((22, 23, 26))
+            self._window.blit(composed, (0, 0))
+        elif self.real_size_mode:
+            self._window.fill((0, 0, 0))
+            self._window.blit(
+                pygame.transform.smoothscale(self._opaque_framebuffer(), (cw, ch)), (0, 0))
+        else:
+            # Plain windowed view: crisp nearest-neighbour upscale.
+            self._window.blit(pygame.transform.scale(self._surface, (cw, ch)), (0, 0))
+
+        if bar_h:
+            bar, _ = self._toolbar(cw)
+            self._window.blit(bar, (0, ch))
+
         pygame.display.flip()
 
 
@@ -1200,10 +1492,28 @@ class IO:
             pygame.K_h: (IO.BUTTON_HOME,),
             pygame.K_ESCAPE: (IO.BUTTON_HOME,),
         }
+        # Simulator-only keys - not badge buttons, so games never see them
+        # via `pressed`/`down`/etc. `run()` checks `meta_pressed` directly.
+        self._meta_key_map = {
+            pygame.K_r: "RELOAD",
+            pygame.K_LSHIFT: "TOGGLE_REAL_SIZE",
+            pygame.K_RSHIFT: "TOGGLE_REAL_SIZE",
+            pygame.K_f: "TOGGLE_FRAME",
+            pygame.K_p: "TOGGLE_CHARGING",
+            pygame.K_EQUALS: "CAL_UP",     # '=' / '+'
+            pygame.K_PLUS: "CAL_UP",
+            pygame.K_KP_PLUS: "CAL_UP",
+            pygame.K_MINUS: "CAL_DOWN",
+            pygame.K_KP_MINUS: "CAL_DOWN",
+        }
+        self.meta_pressed: set = set()
+        # Badge button currently held via a mouse click on the device frame.
+        self._mouse_btn = None
 
     def update(self) -> None:
         self.pressed.clear()
         self.released.clear()
+        self.meta_pressed.clear()
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit()
@@ -1216,11 +1526,26 @@ class IO:
                     for name in self._key_map[event.key]:
                         self.pressed.add(name)
                         self.down.add(name)
+                if event.key in self._meta_key_map:
+                    self.meta_pressed.add(self._meta_key_map[event.key])
             if event.type == pygame.KEYUP:
                 if event.key in self._key_map:
                     for name in self._key_map[event.key]:
                         self.down.discard(name)
                         self.released.add(name)
+            # Clicking the hardware buttons drawn in the device frame presses
+            # the matching badge button.
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                name = screen.button_at(event.pos) if screen is not None else None
+                if name:
+                    self.pressed.add(name)
+                    self.down.add(name)
+                    self._mouse_btn = name
+            if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                if self._mouse_btn:
+                    self.down.discard(self._mouse_btn)
+                    self.released.add(self._mouse_btn)
+                    self._mouse_btn = None
         self.held = set(self.down)
         self.changed = set()
         self.changed.update(self.pressed)
@@ -1300,6 +1625,12 @@ def file_exists(path: str) -> bool:
     return os.path.isfile(map_system_path(path))
 
 
+# Simulated charging state. A badge sitting in its dock/plugged into USB is
+# charging, so we default to True. Press `P` in the simulator to toggle it and
+# exercise charge-aware apps (e.g. the marquee's low-power mode).
+_charging = True
+
+
 def get_battery_level() -> int:
     """Return a fake but plausible battery percentage."""
     return 75
@@ -1307,7 +1638,7 @@ def get_battery_level() -> int:
 
 def is_charging() -> bool:
     """Return whether the badge is currently charging."""
-    return False
+    return _charging
 
 # -----------------------------------------------------------------------------
 # Mock network module for WiFi simulation
@@ -1536,7 +1867,24 @@ def run(update_func, fps: int = 60, init=None, on_exit=None):
             if IO.BUTTON_HOME in io.pressed:
                 result = "__RETURN_TO_MENU__"
                 break
-            
+
+            # Simulator-only meta keys (not badge buttons)
+            if "RELOAD" in io.meta_pressed:
+                result = "__RELOAD__"
+                break
+            if "TOGGLE_REAL_SIZE" in io.meta_pressed:
+                screen.toggle_real_size()
+            if "TOGGLE_FRAME" in io.meta_pressed:
+                screen.toggle_frame_mode()
+            if "CAL_UP" in io.meta_pressed:
+                screen.nudge_real_size(1.03)
+            if "CAL_DOWN" in io.meta_pressed:
+                screen.nudge_real_size(1 / 1.03)
+            if "TOGGLE_CHARGING" in io.meta_pressed:
+                global _charging
+                _charging = not _charging
+                print(f"[Simulator] Charging {'connected' if _charging else 'disconnected'}")
+
             result = update_func()
             screen.present()
             clock.tick(fps)
@@ -1944,6 +2292,158 @@ class PerformanceMonitor:
               f"Imgs:{image_count}({largest_image_kb:5.1f}KB) Fonts:{font_count}", 
               end='', flush=True)
 
+def _unload_app_modules(game_dir: str) -> None:
+    """Tear down everything the previous app's modules touched so the next
+    load - the menu, another app, or a hot reload of the same app - starts
+    clean, mirroring the badge freeing memory when it switches apps."""
+    if game_dir:
+        game_dir_abs = os.path.abspath(game_dir)
+        for p in [p for p in sys.path if os.path.abspath(p).startswith(game_dir_abs)]:
+            while p in sys.path:
+                sys.path.remove(p)
+
+        # Purge this app's compiled bytecode cache directly rather than
+        # relying on _cleanup_pycache()'s later sweep: __pycache__ is keyed
+        # by source mtime, so a reload within the same mtime tick as an edit
+        # could otherwise silently serve stale bytecode.
+        import shutil
+        for root, dirs, _files in os.walk(game_dir_abs):
+            if "__pycache__" in dirs:
+                try:
+                    shutil.rmtree(os.path.join(root, "__pycache__"))
+                except Exception:
+                    pass
+
+    modules_to_remove = []
+    for mod_name, mod in sys.modules.items():
+        if mod and hasattr(mod, "__file__") and mod.__file__:
+            mod_file = os.path.abspath(mod.__file__)
+            if game_dir and mod_file.startswith(game_dir):
+                modules_to_remove.append(mod_name)
+    for mod_name in modules_to_remove:
+        del sys.modules[mod_name]
+
+    # Also remove the main module loaded as "badge_game", plus common app
+    # modules that can conflict (like ui, icon) - they'll be re-imported
+    # fresh on the next load.
+    for mod_name in ("badge_game", "ui", "icon", "beacon", "mona"):
+        if mod_name in sys.modules:
+            del sys.modules[mod_name]
+
+    # Clear image cache to simulate badge behavior (old app's images are freed)
+    Image._cache.clear()
+
+    if _perf_monitor and _perf_monitor.enabled:
+        _perf_monitor.asset_tracker.reset()
+
+    import gc
+    collected = gc.collect()
+    if collected > 0:
+        print(f"[Simulator] Garbage collected {collected} objects")
+
+
+# -----------------------------------------------------------------------------
+# DPI detection (for "real size" mode)
+# -----------------------------------------------------------------------------
+
+def _detect_dpi() -> float:
+    """Best-effort autodetection of the monitor's real pixel density in
+    *device pixels* (the units pygame's window surface uses here), so 'real
+    size' mode is physically accurate on whatever machine you're running on
+    without having to look up your own DPI by hand. Falls back to 96 if
+    detection isn't possible."""
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            return _detect_dpi_macos()
+        if system == "Windows":
+            return _detect_dpi_windows()
+        if system == "Linux":
+            return _detect_dpi_linux()
+    except Exception:
+        pass
+    return 96.0
+
+
+def _detect_dpi_macos() -> float:
+    import ctypes
+    import ctypes.util
+
+    lib_path = ctypes.util.find_library("CoreGraphics")
+    if not lib_path:
+        raise RuntimeError("CoreGraphics not found")
+    cg = ctypes.CDLL(lib_path)
+
+    class CGSize(ctypes.Structure):
+        _fields_ = [("width", ctypes.c_double), ("height", ctypes.c_double)]
+
+    cg.CGMainDisplayID.restype = ctypes.c_uint32
+    cg.CGDisplayScreenSize.restype = CGSize
+    cg.CGDisplayScreenSize.argtypes = [ctypes.c_uint32]
+    cg.CGDisplayPixelsWide.restype = ctypes.c_size_t
+    cg.CGDisplayPixelsWide.argtypes = [ctypes.c_uint32]
+
+    display_id = cg.CGMainDisplayID()
+    size_mm = cg.CGDisplayScreenSize(display_id)
+    # Use the *logical* ("points") width, because SDL/pygame sizes its window
+    # in points on macOS - measured on screen, a set_mode((400,x)) window is
+    # exactly 400 points wide. So points-per-inch is the density that makes a
+    # window physically 57.6mm. (An earlier attempt used native pixels, which
+    # came out 2x too big on Retina.) If a display's reported physical size is
+    # inaccurate this can still be off - the +/- live calibration corrects it.
+    points_wide = cg.CGDisplayPixelsWide(display_id)
+    if size_mm.width <= 0 or points_wide <= 0:
+        raise RuntimeError("CoreGraphics returned no usable display size")
+    return points_wide / (size_mm.width / 25.4)
+
+
+def _detect_dpi_windows() -> float:
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # PROCESS_SYSTEM_DPI_AWARE
+    except Exception:
+        try:
+            user32.SetProcessDPIAware()
+        except Exception:
+            pass
+    hdc = user32.GetDC(0)
+    try:
+        LOGPIXELSX = 88
+        dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, LOGPIXELSX)
+    finally:
+        user32.ReleaseDC(0, hdc)
+    if not dpi:
+        raise RuntimeError("GetDeviceCaps returned no DPI")
+    return float(dpi)
+
+
+def _detect_dpi_linux() -> float:
+    import re
+    import subprocess
+
+    # Most X11 desktops set Xft.dpi to the user's actual configured DPI.
+    try:
+        out = subprocess.run(["xrdb", "-query"], capture_output=True, text=True, timeout=2)
+        m = re.search(r"Xft\.dpi:\s*(\d+)", out.stdout)
+        if m:
+            return float(m.group(1))
+    except Exception:
+        pass
+
+    # Fall back to the physical size xrandr reports for the first
+    # connected output.
+    out = subprocess.run(["xrandr", "--query"], capture_output=True, text=True, timeout=2)
+    m = re.search(r"connected.*?(\d+)x(\d+)\+\d+\+\d+.*?(\d+)mm x (\d+)mm", out.stdout)
+    if not m:
+        raise RuntimeError("xrandr output didn't match")
+    px_w, _px_h, mm_w, _mm_h = (int(g) for g in m.groups())
+    if mm_w <= 0:
+        raise RuntimeError("xrandr reported no physical size")
+    return px_w / (mm_w / 25.4)
+
+
 # -----------------------------------------------------------------------------
 # Entry point
 # -----------------------------------------------------------------------------
@@ -1974,6 +2474,14 @@ def main() -> None:
         "--perf",
         action="store_true",
         help="Show live performance metrics (CPU and memory usage) in terminal.",
+    )
+    parser.add_argument(
+        "--dpi",
+        type=float,
+        default=None,
+        help="Override your monitor's pixels-per-inch (auto-detected by default) used "
+             "to size the Shift 'real size' preview to the badge's actual 57.6x43.2mm "
+             "display. Pass this if the auto-detected value looks wrong.",
     )
     args = parser.parse_args()
     
@@ -2006,7 +2514,14 @@ def main() -> None:
     pygame.init()
 
     global screen, io, SIM_ROOT
-    screen = Screen(scale=args.scale, screenshot_dir=args.screenshot_dir)
+    if args.dpi is not None:
+        dpi = args.dpi
+        print(f"[Simulator] Using --dpi {dpi:.1f}")
+    else:
+        dpi = _detect_dpi()
+        print(f"[Simulator] Detected display DPI: {dpi:.1f} "
+              f"(pass --dpi to override if Shift 'real size' mode looks wrong)")
+    screen = Screen(scale=args.scale, screenshot_dir=args.screenshot_dir, dpi=dpi)
     io = IO()
     
     # Set system root with default to ./badge relative to simulator
@@ -2082,61 +2597,28 @@ def main() -> None:
             exit_func = getattr(module, "on_exit", None)
             result = run(module.update, init=init_func, on_exit=exit_func)
             
+            # Hot-reload: re-import the same app from disk without tearing
+            # down pygame/SDL, so edits show up without restarting the sim.
+            if result == "__RELOAD__":
+                print(f"\n[Simulator] Reloading {app_name}...")
+                _unload_app_modules(game_dir)
+                # current_app is left unchanged, so the next iteration
+                # re-reads game_path fresh from disk.
+                continue
+
             # Check if user pressed Home button to return to menu
             if result == "__RETURN_TO_MENU__":
                 menu_path = os.path.join(SIM_ROOT, "apps", "menu")
                 if os.path.isdir(menu_path) and os.path.isfile(os.path.join(menu_path, "__init__.py")):
                     print(f"\n[Simulator] Returning to menu")
                     current_app = menu_path
-                    
-                    # Clean up sys.path entries added by the previous app
-                    if game_dir:
-                        game_dir_abs = os.path.abspath(game_dir)
-                        paths_to_remove = [p for p in sys.path if os.path.abspath(p).startswith(game_dir_abs)]
-                        for p in paths_to_remove:
-                            while p in sys.path:
-                                sys.path.remove(p)
-                    
-                    # Clean up module cache for clean reload
-                    modules_to_remove = []
-                    for mod_name, mod in sys.modules.items():
-                        if mod and hasattr(mod, "__file__") and mod.__file__:
-                            mod_file = os.path.abspath(mod.__file__)
-                            if game_dir and mod_file.startswith(game_dir):
-                                modules_to_remove.append(mod_name)
-                    
-                    for mod_name in modules_to_remove:
-                        del sys.modules[mod_name]
-                    
-                    # Also remove the main module loaded as "badge_game"
-                    if "badge_game" in sys.modules:
-                        del sys.modules["badge_game"]
-                    
-                    # Also remove common app modules that can conflict (like ui, icon)
-                    # These will be re-imported fresh when the menu loads
-                    for common_mod in ["ui", "icon", "beacon", "mona"]:
-                        if common_mod in sys.modules:
-                            del sys.modules[common_mod]
-                    
-                    # Clear image cache to simulate badge behavior (old app's images are freed)
-                    Image._cache.clear()
-                    
-                    # Reset asset tracker when returning to menu
-                    if _perf_monitor and _perf_monitor.enabled:
-                        _perf_monitor.asset_tracker.reset()
-                    
-                    # Force garbage collection to free memory
-                    import gc
-                    collected = gc.collect()
-                    if collected > 0:
-                        print(f"[Simulator] Garbage collected {collected} objects")
-                    
+                    _unload_app_modules(game_dir)
                     # Continue to next iteration to load the menu
                     continue
                 else:
                     print(f"\n[Simulator] Menu app not found, exiting")
                     break
-            
+
             # If the app returned a path to another app, load it
             elif result and isinstance(result, str):
                 # Check if it's a valid app path
@@ -2144,49 +2626,7 @@ def main() -> None:
                 if os.path.isdir(result_path) and os.path.isfile(os.path.join(result_path, "__init__.py")):
                     print(f"\n[Simulator] Launching app: {result}")
                     current_app = result_path
-                    
-                    # Clean up sys.path entries added by the previous app
-                    if game_dir:
-                        game_dir_abs = os.path.abspath(game_dir)
-                        paths_to_remove = [p for p in sys.path if os.path.abspath(p).startswith(game_dir_abs)]
-                        for p in paths_to_remove:
-                            while p in sys.path:
-                                sys.path.remove(p)
-                    
-                    # Clean up module cache for clean reload
-                    # Remove all modules that were loaded from the previous app
-                    modules_to_remove = []
-                    for mod_name, mod in sys.modules.items():
-                        if mod and hasattr(mod, "__file__") and mod.__file__:
-                            mod_file = os.path.abspath(mod.__file__)
-                            if game_dir and mod_file.startswith(game_dir):
-                                modules_to_remove.append(mod_name)
-                    
-                    for mod_name in modules_to_remove:
-                        del sys.modules[mod_name]
-                    
-                    # Also remove the main module loaded as "badge_game"
-                    if "badge_game" in sys.modules:
-                        del sys.modules["badge_game"]
-                    
-                    # Also remove common app modules that can conflict (like ui, icon)
-                    for common_mod in ["ui", "icon", "beacon", "mona"]:
-                        if common_mod in sys.modules:
-                            del sys.modules[common_mod]
-                    
-                    # Clear image cache to simulate badge behavior (old app's images are freed)
-                    Image._cache.clear()
-                    
-                    # Reset asset tracker when switching apps
-                    if _perf_monitor and _perf_monitor.enabled:
-                        _perf_monitor.asset_tracker.reset()
-                    
-                    # Force garbage collection to free memory
-                    import gc
-                    collected = gc.collect()
-                    if collected > 0:
-                        print(f"[Simulator] Garbage collected {collected} objects")
-                    
+                    _unload_app_modules(game_dir)
                     # Continue to next iteration to load the new app
                     continue
                 else:

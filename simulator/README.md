@@ -120,6 +120,10 @@ python3 simulator/badge_simulator.py badge/apps/quest
   Requires `psutil` to be installed (`pip install psutil`). Metrics update every 0.5 seconds.
   **Badge profiling**: Shows app memory usage relative to the badge's 512KB SRAM limit with warnings
   when memory usage is high or exceeds the badge's capacity.
+- `--dpi` overrides your monitor's pixels-per-inch, used to size the Shift "real size"
+  preview to the badge's actual 57.6×43.2mm display. This is auto-detected on macOS,
+  Windows, and X11 Linux; pass this if that preview looks the wrong size on your setup.
+  You can also fine-tune it live with `+` / `-` (saved between runs) — see below.
 - The simulator automatically makes `/system/...` imports and file operations
   point at the repository tree so you can run unmodified badge apps.
 
@@ -136,14 +140,33 @@ This means you can test the full badge experience, starting from the menu and na
 between apps without restarting the simulator. Press H or Esc at any time to go back to the menu!
 
 ## Controls
-- `A` / `Z` → Button A
-- `B` / `X` → Button B
-- `C` / `Space` → Button C
-- Arrow keys → D-pad
+- `A` / `Z` / `Left` → Button A
+- `B` / `X` / `Enter` → Button B
+- `C` / `Space` / `Right` → Button C
+- Arrow keys → D-pad (Left/Right also double up as A/C, so you can play one-handed)
 - **`H` / `Esc` → Home (return to menu)**
 - `1-9` → Simulate IR beacons (Quest app)
 - `F12` → Take screenshot (when --screenshots is configured)
 - Close the window or press `Ctrl+C` in the terminal to stop the simulator.
+
+### Simulator-only keys
+These aren't badge buttons - apps never see them - they control the simulator itself:
+- **`R` → Hot-reload the running app.** Re-imports its code from disk (picking up any
+  edits you just made) without restarting pygame/SDL. `init()` runs again and `on_exit()`
+  runs first if the app defines one, just like switching apps normally.
+- **`Shift` → Toggle "real size" mode.** Resizes the window to match the real badge's
+  physical display, sized off your monitor's auto-detected pixel density.
+- **`+` / `-` → Fine-tune real size.** If it doesn't match your physical badge (some
+  displays report an inaccurate physical size), nudge it up or down. Your calibration is
+  saved and reused next time.
+- **`F` → Toggle device frame mode.** Shows the live screen composited into a photo of
+  the actual badge hardware, so you can see how it'll look sitting in your hand rather
+  than as a bare rectangle of pixels. It's a normal window you can move and close. In
+  this view you can also **click the A/B/C and up/down buttons in the image** to press
+  them, and any pressed button (mouse or keyboard) lights up.
+- **`P` → Toggle simulated charging.** Flips `is_charging()` between connected and
+  disconnected so you can test charge-aware apps (like the Marquee's low-power mode).
+  The simulator starts in the "charging" state, as if the badge were docked or plugged in.
 
 ## Examples
 

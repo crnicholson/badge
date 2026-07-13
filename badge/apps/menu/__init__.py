@@ -43,27 +43,37 @@ if State:
     State.load("vault_unlocked", _vault_state)
 vault_unlocked = bool(_vault_state.get("unlocked"))
 
-
 def check_konami(button):
-    # Advance the secret sequence. Returns True if this press was absorbed
-    # into a correct/in-progress match, so its normal menu action should be
-    # skipped for this frame.
+    # Advance the secret sequence in the background. UP/DOWN/A/C never get
+    # suppressed here - they always perform their normal menu action, no
+    # matter what. (An earlier version suppressed any matching press, but
+    # since the sequence starts UP, UP that silently ate every other UP
+    # press, so navigating required double presses.)
+    #
+    # The one exception is B: since it launches whatever app is currently
+    # selected, and the nav buttons above are free to move the cursor while
+    # the sequence is mid-entry, we still suppress B's launch - but only on
+    # the single press that's legitimately continuing a correct sequence, so
+    # typing the code doesn't accidentally launch a random app right before
+    # the final press. Normal single B presses to launch an app are
+    # unaffected.
     global konami_progress, konami_until, konami_just_completed
-    if button == KONAMI_SEQUENCE[konami_progress]:
+    matched = button == KONAMI_SEQUENCE[konami_progress]
+    if matched:
         konami_progress += 1
         if konami_progress == len(KONAMI_SEQUENCE):
             konami_progress = 0
             konami_until = io.ticks + KONAMI_CELEBRATION_MS
             konami_just_completed = True
-        return True
-    konami_progress = 1 if button == KONAMI_SEQUENCE[0] else 0
-    return False
+    else:
+        konami_progress = 1 if button == KONAMI_SEQUENCE[0] else 0
+    return matched and button == io.BUTTON_B
 
 
 def draw_konami_celebration():
     t = io.ticks
 
-    # pulsing phosphor flash over the whole screen
+    # pulsing flash over the whole screen
     pulse = 30 + int(30 * (0.5 + 0.5 * math.sin(t / 80)))
     screen.brush = brushes.color(211, 250, 55, pulse)
     screen.draw(shapes.rounded_rectangle(0, 0, 160, 120, 8))
@@ -82,6 +92,7 @@ def draw_konami_celebration():
     screen.draw(shapes.rounded_rectangle(80 - (w / 2) - 6, 52, w + 12, 16, 4))
     screen.brush = brushes.color(211, 250, 55)
     screen.text(konami_banner, 80 - (w / 2), 56)
+
 
 # Auto-discover apps with __init__.py
 apps = []
@@ -133,22 +144,22 @@ icons = load_page_icons(current_page)
 
 active = 0
 
-MAX_ALPHA = 255
-alpha = 30
-
-
 def update():
-    global active, icons, alpha, current_page, total_pages
+    global active, icons, current_page, total_pages
     global konami_just_completed, konami_banner, vault_unlocked, apps
+    global konami_until
 
-    # feed presses into the secret sequence tracker; a press that's part of
-    # a correct (in-progress or completed) match is absorbed and shouldn't
-    # also move the cursor or launch an app this frame
-    konami_c = io.BUTTON_C in io.pressed and check_konami(io.BUTTON_C)
-    konami_a = io.BUTTON_A in io.pressed and check_konami(io.BUTTON_A)
-    konami_up = io.BUTTON_UP in io.pressed and check_konami(io.BUTTON_UP)
-    konami_down = io.BUTTON_DOWN in io.pressed and check_konami(io.BUTTON_DOWN)
-    konami_b = io.BUTTON_B in io.pressed and check_konami(io.BUTTON_B)
+    # feed every press into the background trackers below. Navigation always
+    # happens normally on every single press; the only thing that can ever
+    # be suppressed is B's launch, and only on the one press that legitimately
+    # continues the Konami sequence (see check_konami).
+    suppress_launch = False
+    for button in (io.BUTTON_UP, io.BUTTON_DOWN, io.BUTTON_A, io.BUTTON_B, io.BUTTON_C):
+        if button not in io.pressed:
+            continue
+
+        if check_konami(button):
+            suppress_launch = True
 
     if konami_just_completed:
         konami_just_completed = False
@@ -163,13 +174,13 @@ def update():
             konami_banner = "SECRET APP UNLOCKED!"
 
     # process button inputs to switch between icons
-    if io.BUTTON_C in io.pressed and not konami_c:
+    if io.BUTTON_C in io.pressed:
         active += 1
-    if io.BUTTON_A in io.pressed and not konami_a:
+    if io.BUTTON_A in io.pressed:
         active -= 1
-    if io.BUTTON_UP in io.pressed and not konami_up:
+    if io.BUTTON_UP in io.pressed:
         active -= 3
-    if io.BUTTON_DOWN in io.pressed and not konami_down:
+    if io.BUTTON_DOWN in io.pressed:
         active += 3
     
     # Handle wrapping and page changes
@@ -197,7 +208,7 @@ def update():
             active = len(icons) - 1
     
     # Launch app with error handling
-    if io.BUTTON_B in io.pressed and not konami_b:
+    if io.BUTTON_B in io.pressed and not suppress_launch:
         app_idx = current_page * APPS_PER_PAGE + active
         if app_idx < len(apps):
             app_path = f"/system/apps/{apps[app_idx][1]}"
@@ -236,11 +247,6 @@ def update():
 
     if io.ticks < konami_until:
         draw_konami_celebration()
-
-    if alpha <= MAX_ALPHA:
-        screen.brush = brushes.color(0, 0, 0, 255 - alpha)
-        screen.clear()
-        alpha += 30
 
     return None
 
